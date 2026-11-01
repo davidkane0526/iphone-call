@@ -6,69 +6,18 @@
 #include <string.h>
 #include <unistd.h>
 
-#ifdef IF_BOOTSTRAP_LIBRARY
-#include <stdatomic.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#ifndef IF_PROBE_TARGET_PATH
-#error A fixed target path is required
-#endif
-
-static _Atomic unsigned int IFLoadResult;
-static void IFRecord(const char *phase, size_t stack_size) {
-    struct stat parent;
-    if (lstat("/var/mobile/Library/iPhoneForward", &parent) ||
-        !S_ISDIR(parent.st_mode) || parent.st_uid != geteuid() ||
-        (parent.st_mode & 0077)) return;
-    int fd = open("/var/mobile/Library/iPhoneForward/ringing-bootstrap-status.jsonl",
-                  O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0600);
-    if (fd < 0) return;
-    struct stat info;
-    if (fstat(fd, &info) || !S_ISREG(info.st_mode) || info.st_uid != geteuid() ||
-        (info.st_mode & 0077) || info.st_size > 65536) { close(fd); return; }
-    char line[256];
-    int size = snprintf(line, sizeof(line),
-        "{\"phase\":\"%s\",\"stack_size\":%zu,\"process_id\":%d}\n",
-        phase, stack_size, getpid());
-    if (size > 0 && (size_t)size < sizeof(line)) write(fd, line, (size_t)size);
-    close(fd);
+#ifdef IF_STACK_STRESS_LIBRARY
+static unsigned int IFStressResult;
+__attribute__((noinline)) static unsigned int IFStressStack(void) {
+    volatile unsigned char frame[128 * 1024];
+    for (unsigned int i = 0; i < sizeof(frame); i += 4096) frame[i] = (unsigned char)(i / 4096);
+    unsigned int result = 1;
+    for (unsigned int i = 0; i < sizeof(frame); i += 4096)
+        if (frame[i] != (unsigned char)(i / 4096)) result = 0;
+    return result;
 }
-
-static void *IFLoadOnNormalThread(void *unused) {
-    size_t stack = pthread_get_stacksize_np(pthread_self());
-    IFRecord("normal_thread_started", stack);
-    void *library = dlopen(IF_PROBE_TARGET_PATH, RTLD_NOW | RTLD_LOCAL);
-    unsigned int result = library ? 1 : 0;
-    const char *fixture = getenv("IF_BOOTSTRAP_SYNTHETIC_SELFTEST");
-    if (library && fixture && strcmp(fixture, "1") == 0) {
-        unsigned int (*test)(void) = (unsigned int (*)(void))dlsym(library, "IFProbeSelfTest");
-        result = test ? test() : 0;
-    }
-    IFRecord(result ? "payload_loaded" : "payload_load_failed", stack);
-    atomic_store_explicit(&IFLoadResult, result ? 1 : 2, memory_order_release);
-    return NULL;
-}
-
-__attribute__((constructor)) static void IFBootstrapStart(void) {
-    // Never wait for dyld/Objective-C work while its loader lock is held here.
-    pthread_attr_t attributes;
-    if (pthread_attr_init(&attributes)) return;
-    int error = pthread_attr_setstacksize(&attributes, 1024 * 1024);
-    if (!error) error = pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
-    pthread_t thread;
-    if (!error) error = pthread_create(&thread, &attributes, IFLoadOnNormalThread, NULL);
-    pthread_attr_destroy(&attributes);
-    if (error) atomic_store_explicit(&IFLoadResult, 2, memory_order_release);
-}
-
-unsigned int IFProbeSelfTest(void) {
-    for (unsigned int i = 0; i < 400; ++i) {
-        unsigned int result = atomic_load_explicit(&IFLoadResult, memory_order_acquire);
-        if (result) return result == 1 ? 1 : 0;
-        usleep(25000);
-    }
-    return 0;
-}
+__attribute__((constructor)) static void IFStressStart(void) { IFStressResult = IFStressStack(); }
+unsigned int IFProbeSelfTest(void) { return IFStressResult; }
 #else
 static unsigned int IFTestLibrary(const char *path) {
     void *library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
