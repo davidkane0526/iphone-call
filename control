@@ -1,0 +1,9 @@
+Package: local.iphoneforward.ringingprobe
+Name: iPhone Ringing Probe
+Version: 0.1.0
+Architecture: iphoneos-arm64
+Description: Diagnostic call-state hooks only; no caller data or network access.
+Maintainer: Local device owner
+Author: Local device owner
+Section: Tweaks
+Depends: firmware (>= 16.0)

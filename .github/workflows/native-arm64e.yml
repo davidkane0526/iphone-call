@@ -1,0 +1,40 @@
+name: Native iPhone arm64e diagnostic build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - Tweak.xm
+      - NativeSmoke.c
+      - build-native.sh
+      - verify-native.py
+      - .github/workflows/native-arm64e.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Check out diagnostic source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Obtain pinned Logos preprocessor
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/theos/logos.git tooling/logos
+          git -C tooling/logos checkout 365a4e7028234e90bc2cbc724e5c87607130d3b3
+      - name: Compile with Apple Xcode toolchain
+        shell: bash
+        run: bash build-native.sh
+      - name: Upload build artifacts only
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: iphone-ringing-native-arm64e
+          path: dist/
+          retention-days: 7
