@@ -18,7 +18,7 @@ bash build-native.sh
 
 ## GitHub Actions
 
-工作流支持 workflow_dispatch 手动触发，也会在 main 分支上的诊断源码、构建脚本、ABI 检查器或工作流文件变更时自动构建。首次上传这些文件会触发首轮构建。工作流须位于仓库默认分支才能手动运行。上传和运行前，仍需用户确认具体仓库及授权，当前没有上传或运行。[GitHub 官方手动工作流说明](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow)
+工作流支持 workflow_dispatch 手动触发，也会在 main 分支上的诊断源码、构建脚本、ABI 检查器或工作流文件变更时自动构建。首次上传这些文件会触发首轮构建。工作流须位于仓库默认分支才能手动运行。上传和运行前，必须先取得仓库所有者对具体文件及构建行为的授权。[GitHub 官方手动工作流说明](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow)
 
 工作流使用标准 macos-15 runner，仅申请 contents:read，超时 20 分钟，产物保留 7 天。公开仓库的标准 GitHub-hosted runner 计算免费；产物存储按 GitHub 账户规则计量。上传工件目录仅为 dist/。[GitHub 官方计量说明](https://docs.github.com/en/billing/concepts/product-billing/github-actions)
 
@@ -26,7 +26,8 @@ bash build-native.sh
 
 1. 获取原生构建产物并核对 SHA-256，拒绝旧的未版本化 arm64e ABI。
 2. 在手机独立的原生 arm64e 进程中运行 NativeSmoke，对加载、指针认证、ARC、block 及合成类方法替换/恢复进行测试。
+   测试程序还支持 `--wait-for-injection /absolute/path/library.dylib`，只等待外部加载，使用 RTLD_NOLOAD 检测结果，自身不会主动加载。它用于在可丢弃的自建进程内验证注入链，不能作为 SpringBoard 兼容性证明。
 3. 只有独立进程测试通过并取得用户对新产物的再次测试批准后，才考虑 SpringBoard 注入。
 4. 实际来电测试仍然必须证明回调出现在接听或挂断前，不能以通话记录轮询替代。
 
-原生构建只用于排除静态转换兼容问题，不能预先保证注入路径或系统进程兼容性。当前尚未完成原生构建或真实来电验收。
+原生构建只用于排除静态转换兼容问题，不能预先保证注入路径或系统进程兼容性。CI 通过仅代表构建和元数据检查完成，不能替代手机或真实来电验收。
