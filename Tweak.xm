@@ -86,7 +86,7 @@ static void IFWrite(NSDictionary *record) {
             if (lstat("/var/mobile/Library/iPhoneForward", &directoryInfo) != 0 ||
                 !S_ISDIR(directoryInfo.st_mode) || directoryInfo.st_uid != geteuid() ||
                 (directoryInfo.st_mode & 0077) != 0) return;
-            if ([record[@"status"] intValue] == 4 && [record[@"incoming"] boolValue] && [record[@"call_id_hash"] length] == 64) {
+            if ([record[@"status"] intValue] == 4 && [record[@"call_status"] intValue] == 4 && [record[@"incoming"] boolValue] && [record[@"call_id_hash"] length] == 64) {
                 if (IFPersist(record, "/var/mobile/Library/iPhoneForward/ringing-events")) {
                     CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
                         CFSTR("local.iphoneforward.ringing.events"), NULL, NULL, true);
