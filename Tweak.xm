@@ -9,22 +9,72 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <string.h>
+#include <CommonCrypto/CommonDigest.h>
 
 @interface TUCall : NSObject
 - (int)status;
 - (int)callStatus;
 - (BOOL)isIncoming;
+- (NSString *)uniqueProxyIdentifier;
 @end
 
 static dispatch_queue_t IFProbeQueue;
 static bool IFProbeEnabled;
-static Method IFCallMethod, IFProxyMethod;
-static IMP IFCallOriginal, IFProxyOriginal, IFCallInstalled, IFProxyInstalled;
-static const CFStringRef IFDisableName = CFSTR("local.iphoneforward.ringingprobe.disable");
-static const char *IFLog = "/var/mobile/Library/iPhoneForward/ringing-probe.jsonl";
+static Method IFCallMethod, IFListMethod;
+static IMP IFCallOriginal, IFListOriginal, IFCallInstalled, IFListInstalled;
+static const CFStringRef IFDisableName = CFSTR("local.iphoneforward.ringingprobe.events.disable");
+static const char *IFLog = "/var/mobile/Library/iPhoneForward/ringing-events-probe.jsonl";
 static const off_t IFMaxLogBytes = 1024 * 1024;
+
+static NSString *IFHash(NSString *identifier) {
+    if (![identifier isKindOfClass:[NSString class]] || !identifier.length) return nil;
+    NSData *data = [identifier dataUsingEncoding:NSUTF8StringEncoding];
+    if (!data || data.length > 4096) return nil;
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
+    char hex[CC_SHA256_DIGEST_LENGTH * 2 + 1];
+    for (unsigned int i = 0; i < CC_SHA256_DIGEST_LENGTH; ++i) {
+        hex[2*i] = "0123456789abcdef"[digest[i] >> 4];
+        hex[2*i+1] = "0123456789abcdef"[digest[i] & 15];
+    }
+    hex[sizeof(hex)-1] = 0;
+    return [NSString stringWithUTF8String:hex];
+}
+
+// Durable metadata only. The Python consumer stores encrypted Bark envelopes.
+// The event ID is a SHA-256 of a random per-call identifier, never a number.
+static bool IFPersist(NSDictionary *record, const char *directory) {
+    NSString *key = record[@"call_id_hash"];
+    if (![key isKindOfClass:[NSString class]] || key.length != 64) return false;
+    if ([key rangeOfCharacterFromSet:[[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdef"] invertedSet]].location != NSNotFound) return false;
+    if (mkdir(directory, 0700) != 0 && errno != EEXIST) return false;
+    struct stat info;
+    if (lstat(directory, &info) != 0 || !S_ISDIR(info.st_mode) ||
+        info.st_uid != geteuid() || (info.st_mode & 0077) != 0) return false;
+    NSString *base = [NSString stringWithUTF8String:directory];
+    NSString *finalPath = [base stringByAppendingPathComponent:[key stringByAppendingString:@".json"]];
+    NSString *tempPath = [base stringByAppendingPathComponent:[@".event-" stringByAppendingString:[[NSUUID UUID] UUIDString]]];
+    NSData *data = [NSJSONSerialization dataWithJSONObject:record options:0 error:NULL];
+    if (!data || data.length > 2048) return false;
+    int fd = open(tempPath.fileSystemRepresentation, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (fd < 0) return false;
+    const char *bytes = (const char *)data.bytes;
+    size_t left = data.length;
+    while (left) {
+        ssize_t n = write(fd, bytes, left);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        bytes += n; left -= (size_t)n;
+    }
+    bool ok = left == 0 && fsync(fd) == 0;
+    close(fd);
+    if (ok) ok = link(tempPath.fileSystemRepresentation, finalPath.fileSystemRepresentation) == 0 || errno == EEXIST;
+    unlink(tempPath.fileSystemRepresentation);
+    return ok;
+}
 
 static void IFWrite(NSDictionary *record) {
     if (!IFProbeQueue) return;
@@ -36,6 +86,12 @@ static void IFWrite(NSDictionary *record) {
             if (lstat("/var/mobile/Library/iPhoneForward", &directoryInfo) != 0 ||
                 !S_ISDIR(directoryInfo.st_mode) || directoryInfo.st_uid != geteuid() ||
                 (directoryInfo.st_mode & 0077) != 0) return;
+            if ([record[@"status"] intValue] == 4 && [record[@"incoming"] boolValue] && [record[@"call_id_hash"] length] == 64) {
+                if (IFPersist(record, "/var/mobile/Library/iPhoneForward/ringing-events")) {
+                    CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                        CFSTR("local.iphoneforward.ringing.events"), NULL, NULL, true);
+                }
+            }
             int fd = open(IFLog, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0600);
             if (fd < 0) return;
             struct stat info;
@@ -69,7 +125,9 @@ static void IFObserve(TUCall *call, NSString *hook) {
         if (!call || ![call respondsToSelector:@selector(status)] ||
             ![call respondsToSelector:@selector(callStatus)] ||
             ![call respondsToSelector:@selector(isIncoming)]) return;
+        NSString *identity = [call respondsToSelector:@selector(uniqueProxyIdentifier)] ? IFHash([call uniqueProxyIdentifier]) : nil;
         IFWrite(@{
+            @"call_id_hash": identity ?: @"",
             @"event": @"call_state_callback",
             @"hook": hook,
             @"observed_unix_time": @([[NSDate date] timeIntervalSince1970]),
@@ -87,18 +145,18 @@ static void IFObserve(TUCall *call, NSString *hook) {
 static void IFDisable(CFNotificationCenterRef center, void *observer, CFStringRef name,
                       const void *object, CFDictionaryRef userInfo) {
     __atomic_store_n(&IFProbeEnabled, false, __ATOMIC_RELEASE);
-    BOOL callRestored = NO, proxyRestored = NO;
+    BOOL callRestored = NO, listRestored = NO;
     if (IFCallMethod && IFCallOriginal && method_getImplementation(IFCallMethod) == IFCallInstalled) {
         method_setImplementation(IFCallMethod, IFCallOriginal);
         callRestored = YES;
     }
-    if (IFProxyMethod && IFProxyOriginal && method_getImplementation(IFProxyMethod) == IFProxyInstalled) {
-        method_setImplementation(IFProxyMethod, IFProxyOriginal);
-        proxyRestored = YES;
+    if (IFListMethod && IFListOriginal && method_getImplementation(IFListMethod) == IFListInstalled) {
+        method_setImplementation(IFListMethod, IFListOriginal);
+        listRestored = YES;
     }
     CFNotificationCenterRemoveObserver(center, observer, IFDisableName, NULL);
     IFWrite(@{@"event": @"diagnostic_hooks_disabled", @"call_restored": @(callRestored),
-              @"proxy_restored": @(proxyRestored), @"process_id": @(getpid())});
+              @"list_restored": @(listRestored), @"process_id": @(getpid())});
 }
 
 %group CallStateHook
@@ -111,12 +169,23 @@ static void IFDisable(CFNotificationCenterRef center, void *observer, CFStringRe
 %end
 %end
 
-%group ProxyStateHook
-%hook TUProxyCall
-- (void)setCallStatus:(int)status {
-    __attribute__((objc_precise_lifetime)) TUCall *retainedCall = (TUCall *)self;
+%group CallListHook
+%hook TUCallServicesInterface
+- (void)_handleCurrentCallsChanged:(id)calls callsDisconnected:(id)disconnected {
+    __attribute__((objc_precise_lifetime)) id retainedCalls = calls;
     %orig;
-    IFObserve(retainedCall, @"TUProxyCall.setCallStatus");
+    if (!__atomic_load_n(&IFProbeEnabled, __ATOMIC_ACQUIRE)) return;
+    @try {
+        if ([retainedCalls isKindOfClass:[NSArray class]] ||
+            [retainedCalls isKindOfClass:[NSSet class]] ||
+            [retainedCalls isKindOfClass:[NSOrderedSet class]]) {
+            NSUInteger observed = 0;
+            for (id call in retainedCalls) {
+                if (++observed > 64) break;
+                IFObserve((TUCall *)call, @"TUCallServicesInterface.currentCallsChanged");
+            }
+        }
+    } @catch (__unused NSException *exception) { }
 }
 %end
 %end
@@ -126,26 +195,26 @@ static void IFDisable(CFNotificationCenterRef center, void *observer, CFStringRe
         if (![[NSBundle mainBundle].bundleIdentifier isEqualToString:@"com.apple.springboard"]) return;
         IFProbeQueue = dispatch_queue_create("local.iphoneforward.ringingprobe", DISPATCH_QUEUE_SERIAL);
         Class callClass = NSClassFromString(@"TUCall");
-        Class proxyClass = NSClassFromString(@"TUProxyCall");
+        Class listClass = NSClassFromString(@"TUCallServicesInterface");
         IFCallMethod = callClass ? class_getInstanceMethod(callClass, NSSelectorFromString(@"_handleStatusChange")) : NULL;
-        IFProxyMethod = proxyClass ? class_getInstanceMethod(proxyClass, NSSelectorFromString(@"setCallStatus:")) : NULL;
+        IFListMethod = listClass ? class_getInstanceMethod(listClass, NSSelectorFromString(@"_handleCurrentCallsChanged:callsDisconnected:")) : NULL;
         BOOL callValid = IFCallMethod && strcmp(method_getTypeEncoding(IFCallMethod), "v16@0:8") == 0;
-        BOOL proxyValid = IFProxyMethod && strcmp(method_getTypeEncoding(IFProxyMethod), "v20@0:8i16") == 0;
+        BOOL listValid = IFListMethod && strcmp(method_getTypeEncoding(IFListMethod), "Vv32@0:8@16@24") == 0;
         if (callValid) {
             IFCallOriginal = method_getImplementation(IFCallMethod);
             %init(CallStateHook);
             IFCallInstalled = method_getImplementation(IFCallMethod);
         }
-        if (proxyValid) {
-            IFProxyOriginal = method_getImplementation(IFProxyMethod);
-            %init(ProxyStateHook);
-            IFProxyInstalled = method_getImplementation(IFProxyMethod);
+        if (listValid) {
+            IFListOriginal = method_getImplementation(IFListMethod);
+            %init(CallListHook);
+            IFListInstalled = method_getImplementation(IFListMethod);
         }
         __atomic_store_n(&IFProbeEnabled, true, __ATOMIC_RELEASE);
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), &IFProbeEnabled,
             IFDisable, IFDisableName, NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         IFWrite(@{@"event": @"diagnostic_hooks_loaded",
-                  @"call_hook": @(callValid), @"proxy_hook": @(proxyValid),
+                  @"call_hook": @(callValid), @"call_list_hook": @(listValid),
                   @"process_id": @(getpid())});
     }
 }
@@ -180,6 +249,19 @@ extern "C" unsigned int IFProbeSelfTest(void) {
         BOOL restored = send(object, selector) == 7;
         object = nil;
         objc_disposeClassPair(fixture);
-        return result && hooked && restored ? 1 : 0;
+        char tempDirectory[] = "/tmp/iphone-ring-fixture-XXXXXX";
+        char *created = mkdtemp(tempDirectory);
+        NSString *hash = IFHash(@"synthetic-random-call-fixture");
+        BOOL durable = NO;
+        if (created && hash.length == 64) {
+            NSDictionary *event = @{@"call_id_hash": hash, @"status": @4, @"incoming": @YES};
+            BOOL first = IFPersist(event, created), second = IFPersist(event, created);
+            NSString *path = [[NSString stringWithUTF8String:created] stringByAppendingPathComponent:[hash stringByAppendingString:@".json"]];
+            NSData *data = [NSData dataWithContentsOfFile:path];
+            NSDictionary *decoded = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] : nil;
+            durable = first && second && [decoded[@"call_id_hash"] isEqualToString:hash] && [decoded[@"status"] intValue] == 4;
+            unlink(path.fileSystemRepresentation); rmdir(created);
+        }
+        return result && hooked && restored && durable ? 1 : 0;
     }
 }
