@@ -50,9 +50,11 @@ def inspect(path, expected_type):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 3:
-        raise SystemExit('usage: verify-native.py library.dylib native-smoke-executable')
+    if len(sys.argv) not in (3, 4):
+        raise SystemExit('usage: verify-native.py library.dylib native-smoke-executable [bootstrap.dylib]')
     result = [inspect(Path(sys.argv[1]), 6), inspect(Path(sys.argv[2]), 2)]
+    if len(sys.argv) == 4:
+        result.append(inspect(Path(sys.argv[3]), 6))
     output = Path(sys.argv[1]).parent / 'NATIVE_ABI_MANIFEST.json'
     output.write_text(json.dumps(result, indent=2), encoding='utf-8')
     print(json.dumps({'native_abi_metadata_check': 'passed', 'device_test': 'not_run'}))

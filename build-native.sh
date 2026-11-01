@@ -12,10 +12,17 @@ xcrun --sdk iphoneos clang++ -arch arm64e -isysroot "$probe_sdk" \
 xcrun --sdk iphoneos clang -arch arm64e -isysroot "$probe_sdk" \
     -miphoneos-version-min=16.0 -O2 NativeSmoke.c -o dist/iPhoneRingingNativeSmoke
 codesign --force --sign - dist/iPhoneRingingProbe.dylib
+xcrun --sdk iphoneos clang -arch arm64e -isysroot "$probe_sdk" \
+    -miphoneos-version-min=16.0 -O2 -dynamiclib -DIF_BOOTSTRAP_LIBRARY \
+    '-DIF_PROBE_TARGET_PATH="/var/jb/var/mobile/iphone-forward-build/ringing-events-d002e19b/iPhoneRingingProbe.dylib"' \
+    -Wl,-install_name,@rpath/iPhoneRingingBootstrap.dylib \
+    NativeSmoke.c -o dist/iPhoneRingingBootstrap.dylib
 codesign --force --sign - dist/iPhoneRingingNativeSmoke
+codesign --force --sign - dist/iPhoneRingingBootstrap.dylib
 codesign --verify --strict dist/iPhoneRingingProbe.dylib
 codesign --verify --strict dist/iPhoneRingingNativeSmoke
-python3 verify-native.py dist/iPhoneRingingProbe.dylib dist/iPhoneRingingNativeSmoke
-shasum -a 256 dist/iPhoneRingingProbe.dylib dist/iPhoneRingingNativeSmoke > dist/SHA256SUMS
+codesign --verify --strict dist/iPhoneRingingBootstrap.dylib
+python3 verify-native.py dist/iPhoneRingingProbe.dylib dist/iPhoneRingingNativeSmoke dist/iPhoneRingingBootstrap.dylib
+shasum -a 256 dist/iPhoneRingingProbe.dylib dist/iPhoneRingingNativeSmoke dist/iPhoneRingingBootstrap.dylib > dist/SHA256SUMS
 xcodebuild -version > dist/XCODE_VERSION.txt
 printf 'Build complete. Device ABI and loading tests are still required.\n'
